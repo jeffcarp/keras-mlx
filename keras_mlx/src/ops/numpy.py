@@ -198,16 +198,6 @@ def any(x, axis=None, keepdims=False):
     return mx.any(x, axis=axis, keepdims=keepdims)
 
 
-def amax(x, axis=None, keepdims=False):
-    x = convert_to_tensor(x)
-    return mx.max(x, axis=axis, keepdims=keepdims)
-
-
-def amin(x, axis=None, keepdims=False):
-    x = convert_to_tensor(x)
-    return mx.min(x, axis=axis, keepdims=keepdims)
-
-
 def append(x1, x2, axis=None):
     x1, x2 = _promote(x1, x2)
     return mx.concatenate([x1, x2], axis=axis)
