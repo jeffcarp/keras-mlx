@@ -14,15 +14,19 @@ from keras.src.backend.common.backend_utils import vectorize_impl
 from keras_mlx.src.ops.core import cast
 from keras_mlx.src.ops.core import convert_to_tensor
 from keras_mlx.src.ops.core import convert_to_tensors
-from keras_mlx.src.ops.core import is_tensor
 from keras_mlx.src.ops.core import slice
 from keras_mlx.src.ops.core import to_mlx_dtype
+
+
+def _result_dtype(*xs):
+    # Python scalars have no dtype so they stay weak in result_type.
+    return result_type(*[getattr(x, "dtype", type(x)) for x in xs])
 
 
 def _promote(*xs):
     # mlx promotes uint32 + signed to int32, keras/jax want int64. Cast to
     # result_type so the output dtype matches the other backends.
-    dtype = result_type(*[getattr(x, "dtype", type(x)) for x in xs])
+    dtype = _result_dtype(*xs)
     return [convert_to_tensor(x, dtype) for x in xs]
 
 
@@ -133,6 +137,12 @@ def _reduces_empty_axis(shape, axis):
     return builtins.any(shape[a % len(shape)] == 0 for a in axes)
 
 
+def _empty_result_shape(x, axis, keepdims):
+    # The output shape when x is empty but the reduced axes are not, else None.
+    if 0 in x.shape and not _reduces_empty_axis(x.shape, axis):
+        return _reduced_shape(x.shape, axis, keepdims)
+
+
 def max(x, axis=None, keepdims=False, initial=None):
     x = convert_to_tensor(x)
     if 0 in x.shape:
@@ -146,7 +156,8 @@ def max(x, axis=None, keepdims=False, initial=None):
         if needs_initial and initial is None:
             raise ValueError("Cannot compute the max of an empty tensor.")
         fill = initial if needs_initial else 0
-        return mx.full(out_shape, fill, dtype=x.dtype)
+        # mx.full mishandles dtype=bool with an int fill.
+        return mx.full(out_shape, fill).astype(x.dtype)
 
     result = mx.max(x, axis=axis, keepdims=keepdims)
     if initial is not None:
@@ -195,6 +206,10 @@ def all(x, axis=None, keepdims=False):
 
 def any(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    if x.dtype in (mx.int8, mx.uint8):
+        # The Metal reduce treats 1 byte ints as bool, so values like 2 are
+        # lost. Remove once mlx fixes it.
+        x = x != 0
     return mx.any(x, axis=axis, keepdims=keepdims)
 
 
@@ -262,6 +277,10 @@ def arctanh(x):
 
 def argmax(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    # mlx rejects empty input, but jax returns an empty result here.
+    empty_shape = _empty_result_shape(x, axis, keepdims)
+    if empty_shape is not None:
+        return mx.zeros(empty_shape, mx.int32)
     # cast to int32 to align with other backends
     indices = mx.argmax(x, axis=axis, keepdims=keepdims)
     # Indices carry no grad, and mlx raises if a later gather sees one.
@@ -270,6 +289,9 @@ def argmax(x, axis=None, keepdims=False):
 
 def argmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    empty_shape = _empty_result_shape(x, axis, keepdims)
+    if empty_shape is not None:
+        return mx.zeros(empty_shape, mx.int32)
     # cast to int32 to align with other backends
     indices = mx.argmin(x, axis=axis, keepdims=keepdims)
     return mx.stop_gradient(indices).astype(mx.int32)
@@ -375,15 +397,15 @@ def bitwise_xor(x, y):
 
 
 def bitwise_left_shift(x, y):
+    # Take the result dtype before converting so Python scalars stay weak.
+    result_dtype = _result_dtype(x, y)
+    # jax and numpy shift booleans as integers.
+    if result_dtype == "bool":
+        result_dtype = "int32"
     x = convert_to_tensor(x)
     if not isinstance(y, int):
         y = convert_to_tensor(y)
 
-    # handle result dtype to match other backends
-    types = [x.dtype]
-    if is_tensor(y):
-        types.append(y.dtype)
-    result_dtype = result_type(*types)
     mlx_result_dtype = to_mlx_dtype(result_dtype)
 
     result = mx.left_shift(x, y)
@@ -397,15 +419,15 @@ def left_shift(x, y):
 
 
 def bitwise_right_shift(x, y):
+    # Take the result dtype before converting so Python scalars stay weak.
+    result_dtype = _result_dtype(x, y)
+    # jax and numpy shift booleans as integers.
+    if result_dtype == "bool":
+        result_dtype = "int32"
     x = convert_to_tensor(x)
     if not isinstance(y, int):
         y = convert_to_tensor(y)
 
-    # handle result dtype to match other backends
-    types = [x.dtype]
-    if is_tensor(y):
-        types.append(y.dtype)
-    result_dtype = result_type(*types)
     mlx_result_dtype = to_mlx_dtype(result_dtype)
 
     result = mx.right_shift(x, y)
@@ -513,8 +535,7 @@ def copy(x):
 
 
 def copysign(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
+    x1, x2 = _promote(x1, x2)
     dtype = _mlx_result_dtype(result_type(x1.dtype, x2.dtype, float))
     x1 = x1.astype(dtype)
     x2 = x2.astype(dtype)
@@ -549,12 +570,12 @@ def cross(x1, x2, axisa=-1, axisb=-1, axisc=-1, axis=None):
 
     result = mx.linalg.cross(x1, x2)
 
-    if x1.shape[-1] == 2:
-        result = result[
-            ..., 2
-        ]  # if inputs are 2D vectors, take only scalar result
+    # Two 2-vectors give a scalar. A mixed pair is padded to 3.
+    scalar_result = x1.shape[-1] == 2 and x2.shape[-1] == 2
+    if scalar_result:
+        result = result[..., 2]
 
-    if axisc != -1:
+    if axisc != -1 and not scalar_result:
         result = mx.moveaxis(result, -1, axisc)
 
     return result
@@ -628,7 +649,12 @@ def digitize(x, bins):
     x = convert_to_tensor(x)
     bins = convert_to_tensor(bins)
 
-    return (x[..., None] >= bins).sum(axis=-1)
+    if bins.size == 0:
+        return mx.zeros(x.shape, dtype=mx.int32)
+    # Counting works for either direction, numpy flips the count for
+    # decreasing bins.
+    count = searchsorted_linear(bins, x, side="right")
+    return mx.where(bins[0] > bins[-1], bins.size - count, count)
 
 
 def dot(x1, x2):
@@ -936,7 +962,8 @@ def min(x, axis=None, keepdims=False, initial=None):
         if needs_initial and initial is None:
             raise ValueError("Cannot compute the min of an empty tensor.")
         fill = initial if needs_initial else 0
-        return mx.full(out_shape, fill, dtype=x.dtype)
+        # mx.full mishandles dtype=bool with an int fill.
+        return mx.full(out_shape, fill).astype(x.dtype)
 
     result = mx.min(x, axis=axis, keepdims=keepdims)
     if initial is not None:
@@ -1112,8 +1139,8 @@ def prod(x, axis=None, keepdims=False, dtype=None):
     if dtype is None:
         dtype = _widen_reduce_int_dtype(result_type(x.dtype))
     mlx_dtype = to_mlx_dtype(dtype)
-    output = mx.prod(x, axis=axis, keepdims=keepdims)
-    return output.astype(mlx_dtype)
+    # The dtype is the accumulator dtype, so cast first (floats truncate).
+    return mx.prod(x.astype(mlx_dtype), axis=axis, keepdims=keepdims)
 
 
 def _quantile_prep(x):
@@ -1518,8 +1545,7 @@ def divide(x1, x2):
 
 
 def divide_no_nan(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
+    x1, x2 = _promote(x1, x2)
     safe_x2 = mx.where(x2 == 0, 1, x2)
     return mx.where(x2 == 0, 0, mx.divide(x1, safe_x2))
 
@@ -1585,6 +1611,10 @@ def sum(x, axis=None, keepdims=False):
     if isinstance(x, (list, tuple)):
         x = stack(x)
     x = convert_to_tensor(x)
+    if x.ndim == 0:
+        # mlx widens n-d small ints but keeps the dtype of a 0-d input.
+        dtype = _widen_reduce_int_dtype(standardize_dtype(x.dtype))
+        x = x.astype(_mlx_result_dtype(dtype))
     return mx.sum(x, axis=axis, keepdims=keepdims)
 
 
@@ -1611,6 +1641,9 @@ def floor_divide(x1, x2):
     dtype = result_type(
         getattr(x1, "dtype", type(x1)), getattr(x2, "dtype", type(x2))
     )
+    # jax and numpy floor divide booleans as integers.
+    if dtype == "bool":
+        dtype = "int32"
     x1 = convert_to_tensor(x1, dtype=dtype)
     x2 = convert_to_tensor(x2, dtype=dtype)
     if "int" in standardize_dtype(dtype):
@@ -1696,7 +1729,8 @@ def correlate(x1, x2, mode="valid"):
 
 
 def select(condlist, choicelist, default=0):
-    x = convert_to_tensor(default)
+    # Python scalars stay weak, so they do not widen the choices' dtype.
+    *choicelist, x = _promote(*choicelist, default)
 
     for condition, choice in zip(reversed(condlist), reversed(choicelist)):
         x = mx.where(condition, choice, x)
@@ -1715,17 +1749,15 @@ def slogdet(x):
     target = x.dtype
     if x.dtype in (mx.bfloat16, mx.float16):
         x = x.astype(mx.float32)
-    # mlx lu_factor aborts the whole process on an exactly singular
-    # input, so compute from the eigenvalues, which handle singular
-    # matrices naturally.
+    # An exact zero pivot gives sign 0 and log(0) = -inf, which the eigenvalue
+    # product cannot, and no complex division is needed.
     with mx.stream(mx.cpu):
-        w = mx.linalg.eigvals(x)
-    absw = mx.abs(w)
-    logabsdet = mx.sum(mx.log(absw), axis=-1)
-    # Metal complex division gives nan for a tiny divisor, so divide the parts.
-    safe = mx.where(absw > 0, absw, 1)
-    unit = mx.real(w) / safe + 1j * (mx.imag(w) / safe)
-    sign = mx.round(mx.real(mx.prod(unit, axis=-1)))
+        lu, pivots = mx.linalg.lu_factor(x)
+    diag = mx.diagonal(lu, axis1=-2, axis2=-1)
+    swaps = mx.sum(pivots != mx.arange(pivots.shape[-1]), axis=-1)
+    negative = mx.sum(diag < 0, axis=-1) + swaps
+    sign = mx.where(mx.all(diag != 0, axis=-1), 1 - 2 * (negative % 2), 0)
+    logabsdet = mx.sum(mx.log(mx.abs(diag)), axis=-1)
     return (sign.astype(target), logabsdet.astype(target))
 
 
@@ -1797,6 +1829,19 @@ def unravel_index(indices, shape):
     return tuple(reversed(coords))
 
 
+def _searchsorted_less(a, b, side):
+    # Whether a sorts before b, with NaN last and equal to another NaN.
+    has_nan = mx.issubdtype(a.dtype, mx.floating) or mx.issubdtype(
+        b.dtype, mx.floating
+    )
+    less = a < b if side == "left" else a <= b
+    if has_nan and side == "left":
+        less = less | (mx.isnan(b) & ~mx.isnan(a))
+    elif has_nan:
+        less = less | mx.isnan(b)
+    return less
+
+
 def searchsorted_binary(a, b, side="left"):
     original_shape = b.shape
     b_flat = b.reshape(-1)
@@ -1805,14 +1850,8 @@ def searchsorted_binary(a, b, side="left"):
     steps = math.ceil(math.log2(size))
     indices = mx.full(b_flat.shape, vals=size // 2, dtype=mx.int32)
 
-    if side == "left":
-
-        def comparison(x, y):
-            return x <= y
-    else:
-
-        def comparison(x, y):
-            return x < y
+    def comparison(x, y):
+        return ~_searchsorted_less(y, x, side)
 
     upper = size
     lower = 0
@@ -1837,6 +1876,11 @@ def searchsorted_linear(a, b, side="left"):
         result = (a[None, :] < b_flat_broadcast).sum(axis=1)
     else:
         result = (a[None, :] <= b_flat_broadcast).sum(axis=1)
+    if mx.issubdtype(b.dtype, mx.floating):
+        # Only NaN values need fixing, so the full comparison runs on them.
+        nan = mx.array(float("nan"), dtype=b.dtype)
+        nan_result = _searchsorted_less(a, nan, side).sum()
+        result = mx.where(mx.isnan(b_flat), nan_result, result)
 
     return result.reshape(original_shape)
 
@@ -2178,14 +2222,20 @@ def fmin(x1, x2):
 
 
 def fmod(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
+    x1, x2 = _promote(x1, x2)
     dtype = result_type(x1.dtype, x2.dtype)
     if dtype == "bool":
         dtype = "int32"
     mlx_dtype = _mlx_result_dtype(dtype)
     x1 = x1.astype(mlx_dtype)
     x2 = x2.astype(mlx_dtype)
+    if dtype in ("int8", "int16", "int32"):
+        # Avoid abs, which wraps for the minimum value, and widening, which
+        # int32 has no room for. Shift the mod style remainder back to the sign
+        # of the dividend. A divisor of -1 gives zero and would trap on the
+        # minimum.
+        r = mx.remainder(x1, mx.where(x2 == -1, mx.ones_like(x2), x2))
+        return mx.where((r != 0) & ((r < 0) != (x1 < 0)), r - x2, r)
     # mx.remainder is mod style, taking the sign of the divisor. fmod takes
     # the sign of the dividend and works on magnitudes.
     return mx.sign(x1) * mx.remainder(mx.abs(x1), mx.abs(x2))
@@ -2205,12 +2255,14 @@ def _integer_result_dtype(op_name, x1, x2):
 
 
 def gcd(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
+    x1, x2 = _promote(x1, x2)
     dtype = _integer_result_dtype("gcd", x1, x2)
     mlx_dtype = _mlx_result_dtype(dtype)
-    a = mx.abs(x1.astype(mlx_dtype))
-    b = mx.abs(x2.astype(mlx_dtype))
+    # Take magnitudes as unsigned so that abs of the minimum does not wrap.
+    unsigned = {mx.int8: mx.uint8, mx.int16: mx.uint16, mx.int32: mx.uint32}
+    unsigned = unsigned.get(mlx_dtype, mlx_dtype)
+    a = mx.abs(x1.astype(mlx_dtype)).astype(unsigned)
+    b = mx.abs(x2.astype(mlx_dtype)).astype(unsigned)
     # Masked elementwise Euclid with a fixed iteration count, so the loop
     # unrolls into a static graph. The worst case is a consecutive
     # Fibonacci pair, which needs about 1.44 * log2(max) iterations.
@@ -2222,7 +2274,7 @@ def gcd(x1, x2):
             mx.where(nonzero, b, a),
             mx.where(nonzero, mx.remainder(a, b_safe), 0),
         )
-    return a
+    return a.astype(mlx_dtype)
 
 
 def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):
@@ -2275,8 +2327,7 @@ def hanning(x):
 
 
 def heaviside(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
+    x1, x2 = _promote(x1, x2)
     dtype = result_type(x1.dtype, x2.dtype)
     if dtype in ("int8", "int16", "int32", "uint8", "uint16", "uint32"):
         dtype = config.floatx()
@@ -2297,8 +2348,7 @@ def hsplit(x, indices_or_sections):
 
 
 def hypot(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
+    x1, x2 = _promote(x1, x2)
     dtype = result_type(x1.dtype, x2.dtype)
     if dtype in ("int8", "int16", "int32", "uint8", "uint16", "uint32"):
         dtype = config.floatx()
@@ -2423,8 +2473,7 @@ def kron(x1, x2):
 
 
 def lcm(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
+    x1, x2 = _promote(x1, x2)
     # Validate here so a non-integer dtype names lcm rather than gcd.
     _integer_result_dtype("lcm", x1, x2)
     g = gcd(x1, x2)
@@ -2565,6 +2614,12 @@ def nanmean(x, axis=None, keepdims=False):
 
 
 def nanmedian(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    empty_shape = _empty_result_shape(x, axis, keepdims)
+    if empty_shape is not None:
+        # mlx cannot reshape an empty array, so build the empty result.
+        dtype = to_mlx_dtype(dtypes.promote_to_float_dtype(x.dtype))
+        return mx.zeros(empty_shape, dtype)
     return nanquantile(x, 0.5, axis=axis, keepdims=keepdims)
 
 
@@ -2633,8 +2688,7 @@ def nanvar(x, axis=None, keepdims=False):
 
 
 def nextafter(x1, x2):
-    x1 = convert_to_tensor(x1)
-    x2 = convert_to_tensor(x2)
+    x1, x2 = _promote(x1, x2)
     dtype = result_type(x1.dtype, x2.dtype, float)
     mlx_dtype = _mlx_result_dtype(dtype)
     x1 = x1.astype(mlx_dtype)

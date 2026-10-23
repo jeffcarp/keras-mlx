@@ -8,6 +8,7 @@ from keras.src.backend.common import standardize_dtype
 from keras.src.backend.common.backend_utils import canonicalize_axis
 from keras.src.utils.module_utils import scipy
 from keras_mlx.src.ops.core import convert_to_tensor
+from keras_mlx.src.ops.core import promote_to_float
 from keras_mlx.src.ops.core import to_mlx_dtype
 
 
@@ -147,7 +148,12 @@ def top_k(x, k, sorted=True, is_stable=True):
             "`k` must be less than or equal to the size of the last "
             f"dimension of `x` ({x.shape[-1]}). Received: k={k}"
         )
-    ranked = mx.negative(x)
+    if mx.issubdtype(x.dtype, mx.integer):
+        # Negation wraps unsigned ints and leaves the signed minimum in place,
+        # so rank by bitwise not, which reverses the order without overflow.
+        ranked = mx.bitwise_invert(x)
+    else:
+        ranked = mx.negative(x)
     if is_stable:
         # mx.argsort is stable, so ranking the whole axis breaks ties by the
         # lower index the way the other backends do. mx.argpartition makes no
@@ -186,6 +192,12 @@ def in_top_k(targets, predictions, k):
 
 def logsumexp(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
+    # Ints would subtract the max in the int dtype and wrap around.
+    x = promote_to_float(x)
+    if x.size == 0:
+        # mlx rejects empty input, jax reduces it to -inf.
+        out_shape = mx.sum(x, axis, keepdims).shape
+        return mx.full(out_shape, -mx.inf, dtype=x.dtype)
     return mx.logsumexp(x, axis, keepdims)
 
 
@@ -695,9 +707,15 @@ def gammainc(x1, x2):
     # complement.
     fraction = 1.0 - _upper_gamma_fraction(a, x) * prefactor
     out = mx.where(x < a + 1.0, series, fraction)
-    # The logarithm above is not finite at x equal to zero, where the answer
-    # is simply zero.
-    out = mx.where(x > 0, out, mx.zeros_like(out))
+    # The logarithm above is not finite at the edges of the domain. Later
+    # patches take precedence, and the invalid inputs come last.
+    out = mx.where(mx.isinf(x) & (a > 0), 1.0, out)
+    out = mx.where(mx.isinf(a) & (x < mx.inf), 0.0, out)
+    out = mx.where((x == 0) & (a > 0), 0.0, out)
+    out = mx.where((a == 0) & (x > 0), 1.0, out)
+    invalid = mx.isnan(a) | mx.isnan(x) | (a < 0) | (x < 0)
+    invalid = invalid | ((a == 0) & (x == 0)) | (mx.isinf(a) & mx.isinf(x))
+    out = mx.where(invalid, mx.nan, out)
     return out.astype(to_mlx_dtype(dtype))
 
 
