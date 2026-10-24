@@ -19,6 +19,7 @@ distribution_lib = None
 def _register_tf_converter():
     try:
         import sys
+
         if "tensorflow" in sys.modules:
             import mlx.core as mx
             import numpy as np
@@ -26,7 +27,10 @@ def _register_tf_converter():
 
             tf.register_tensor_conversion_function(
                 mx.array,
-                lambda val, dtype=None, name=None, as_ref=False: tf.convert_to_tensor(
+                lambda val,
+                dtype=None,
+                name=None,
+                as_ref=False: tf.convert_to_tensor(
                     np.array(val), dtype=dtype, name=name
                 ),
             )
@@ -39,6 +43,7 @@ import sys  # noqa: E402
 if "tensorflow" in sys.modules:
     _register_tf_converter()
 else:
+
     class _TFImportHook:
         @classmethod
         def find_spec(cls, fullname, path=None, target=None):
@@ -46,6 +51,7 @@ else:
                 if cls in sys.meta_path:
                     sys.meta_path.remove(cls)
                 import importlib
+
                 importlib.import_module("tensorflow")
                 _register_tf_converter()
             return None
