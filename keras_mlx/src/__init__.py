@@ -14,3 +14,40 @@ SUPPORTS_GRADIENT = True
 IS_THREAD_SAFE = False  # False as of mlx 0.24.0
 
 distribution_lib = None
+
+
+def _register_tf_converter():
+    try:
+        import sys
+        if "tensorflow" in sys.modules:
+            import mlx.core as mx
+            import numpy as np
+            import tensorflow as tf
+
+            tf.register_tensor_conversion_function(
+                mx.array,
+                lambda val, dtype=None, name=None, as_ref=False: tf.convert_to_tensor(
+                    np.array(val), dtype=dtype, name=name
+                ),
+            )
+    except (ImportError, AttributeError):
+        pass
+
+
+import sys  # noqa: E402
+
+if "tensorflow" in sys.modules:
+    _register_tf_converter()
+else:
+    class _TFImportHook:
+        @classmethod
+        def find_spec(cls, fullname, path=None, target=None):
+            if fullname == "tensorflow":
+                if cls in sys.meta_path:
+                    sys.meta_path.remove(cls)
+                import importlib
+                importlib.import_module("tensorflow")
+                _register_tf_converter()
+            return None
+
+    sys.meta_path.insert(0, _TFImportHook)
